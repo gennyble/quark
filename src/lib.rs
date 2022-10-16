@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
 	borrow::{Borrow, BorrowMut, Cow},
 	iter::{self, Peekable},
@@ -87,7 +88,7 @@ impl Lexer {
 			if ch == '\\' && !escape {
 				escape = true;
 				continue;
-			} else if ch == '\\' && escape {
+			} else if escape {
 				escape = false;
 				current.push(ch);
 				continue;
@@ -198,6 +199,12 @@ impl LexTok {
 	}
 }
 
+impl fmt::Display for LexTok {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", self.string())
+	}
+}
+
 pub struct Parser {
 	last_line_blank: bool,
 	tokens: Vec<Token>,
@@ -303,16 +310,33 @@ impl Parser {
 		let lextokens = Self::take_until(iter, LexTok::EndOfLine, false);
 		let built = Self::build_line(lextokens);
 
+		// Make sure the last token is a paragraph and add a break if we need one
 		match self.tokens.last_mut() {
 			Some(Token::Paragraph { inner }) => {
 				if !self.last_line_blank {
 					inner.push(Inline::Break);
-					inner.extend(built);
 				} else {
-					self.tokens.push(Token::Paragraph { inner: built })
+					self.tokens.push(Token::Paragraph { inner: vec![] });
 				}
 			}
-			_ => self.tokens.push(Token::Paragraph { inner: built }),
+			_ => self.tokens.push(Token::Paragraph { inner: vec![] }),
+		}
+
+		// Keep pushing inlines, collapsing Text if we ended up with more than one
+		for inl in built {
+			match self.tokens.last_mut().unwrap() {
+				Token::Paragraph { inner } => {
+					if let Inline::Text(ref str) = inl {
+						if let Some(Inline::Text(ref mut text_str)) = inner.last_mut() {
+							text_str.push_str(str);
+							continue;
+						}
+					}
+
+					inner.push(inl);
+				}
+				_ => unreachable!(),
+			}
 		}
 
 		self.last_line_blank = false;
@@ -324,7 +348,8 @@ impl Parser {
 				match iter.next() {
 					Some(LexTok::CodeEnd) => (),
 					//FIXME: gen- Error
-					_ => panic!("Expected LexTok::CodeEnd"),
+					Some(tok) => panic!("Expected LexTok::CodeEnd but got {tok:?}"),
+					None => panic!("Expected LexTok::CodeEnd but got None"),
 				}
 
 				tokens.push(Inline::Code(code));
@@ -332,6 +357,7 @@ impl Parser {
 			Some(LexTok::CodeEnd) => {
 				tokens.push(Inline::Code(String::new()));
 			}
+			None => tokens.push(Inline::Text(LexTok::CodeStart.string().into_owned())),
 			_ => panic!(),
 		}
 	}
@@ -342,14 +368,17 @@ impl Parser {
 				match iter.next() {
 					Some(LexTok::ReferenceLinkEnd) => (),
 					//FIXME: gen- Error
-					_ => panic!("Expected LexTok::CodeEnd"),
+					_ => panic!("Expected LexTok::ReferenceLinkEnd"),
 				}
 
 				tokens.push(Inline::Reflink(reftext));
 			}
-			Some(LexTok::CodeEnd) => {
-				tokens.push(Inline::Code(String::new()));
-			}
+			Some(LexTok::ReferenceLinkEnd) => tokens.push(Inline::Text(format!(
+				"{}{}",
+				LexTok::ReferenceLinkStart,
+				LexTok::ReferenceLinkEnd
+			))),
+			None => tokens.push(Inline::Text(LexTok::ReferenceLinkStart.to_string())),
 			_ => panic!(),
 		}
 	}
@@ -507,6 +536,21 @@ mod test {
 	}
 
 	#[test]
+	fn escape_parses() {
+		let txt = "`\\``";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::Code(String::from("`"))]
+			}]
+		)
+	}
+
+	#[test]
 	fn inline_code_parses_correctly() {
 		let txt = "`code`";
 
@@ -550,6 +594,21 @@ mod test {
 			parser.tokens,
 			vec![Token::Paragraph {
 				inner: vec![Inline::reflink("reflink")]
+			}]
+		)
+	}
+
+	#[test]
+	fn empty_reflink_is_text() {
+		let txt = "{}";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::text("{}")]
 			}]
 		)
 	}
