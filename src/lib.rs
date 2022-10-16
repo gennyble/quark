@@ -4,7 +4,7 @@ use std::{
 	str::Chars,
 };
 
-struct Lexer {
+pub struct Lexer {
 	in_code_block: bool,
 	tokens: Vec<LexTok>,
 }
@@ -17,8 +17,8 @@ impl Lexer {
 		}
 	}
 
-	fn lex(&mut self, raw: String) {
-		let lines = raw.lines();
+	fn lex<S: AsRef<str>>(&mut self, raw: S) {
+		let lines = raw.as_ref().lines();
 
 		for line in lines {
 			self.parse_line(line);
@@ -65,28 +65,55 @@ impl Lexer {
 	}
 
 	fn parse_for_inlines(&mut self, chars: &mut Peekable<Chars>) {
+		let mut escape = false;
 		let mut code = false;
+		let mut reflink = false;
 		let mut current = String::new();
-		let mut push_and_clear = |toks: &mut Vec<LexTok>, curr: &mut String| {
-			if !curr.is_empty() {
-				toks.push(LexTok::Text(curr.clone()));
-				curr.clear();
-			}
-		};
+
+		macro_rules! push_and_clear {
+			() => {
+				if escape {
+					current.push('\\');
+				}
+
+				if !current.is_empty() {
+					self.tokens.push(LexTok::Text(current.clone()));
+					current.clear();
+				}
+			};
+		}
 
 		for ch in chars {
-			if ch == '`' && !code {
-				push_and_clear(&mut self.tokens, &mut current);
+			if ch == '\\' && !escape {
+				escape = true;
+				continue;
+			} else if ch == '\\' && escape {
+				escape = false;
+				current.push(ch);
+				continue;
+			}
+
+			if ch == '`' && !code && !reflink {
+				push_and_clear!();
 				self.tokens.push(LexTok::CodeStart);
 				code = true;
 				continue;
-			} else if ch == '`' && code {
-				push_and_clear(&mut self.tokens, &mut current);
+			} else if ch == '`' && code && !reflink {
+				push_and_clear!();
 				self.tokens.push(LexTok::CodeEnd);
 				code = false;
 				continue;
-			} else if code {
-				current.push(ch);
+			}
+
+			if ch == '{' && !reflink && !code {
+				push_and_clear!();
+				self.tokens.push(LexTok::ReferenceLinkStart);
+				reflink = true;
+				continue;
+			} else if ch == '}' && reflink && !code {
+				push_and_clear!();
+				self.tokens.push(LexTok::ReferenceLinkEnd);
+				reflink = false;
 				continue;
 			}
 
@@ -94,7 +121,7 @@ impl Lexer {
 		}
 
 		// Be sure to push anything leftover
-		push_and_clear(&mut self.tokens, &mut current);
+		push_and_clear!();
 	}
 
 	fn header(&mut self, chars: &mut Peekable<Chars>) {
@@ -133,6 +160,8 @@ enum LexTok {
 	EndOfLine,
 	CodeStart,
 	CodeEnd,
+	ReferenceLinkStart,
+	ReferenceLinkEnd,
 	BlankLine,
 }
 
@@ -141,11 +170,13 @@ impl LexTok {
 		match self {
 			LexTok::Header { level } => iter::repeat('#').take(*level as usize).collect(),
 			LexTok::Text(txt) => Cow::Borrowed(&txt),
-			LexTok::CodeBlockStart { lang } => Cow::Owned(format!("```{}", lang)),
+			LexTok::CodeBlockStart { lang } => Cow::Owned(format!("```{lang}")),
 			LexTok::CodeBlockEnd => Cow::Borrowed("```"),
 			LexTok::EndOfLine => Cow::Borrowed("\n"),
 			LexTok::CodeStart => Cow::Borrowed("`"),
 			LexTok::CodeEnd => Cow::Borrowed("`"),
+			LexTok::ReferenceLinkStart => Cow::Borrowed("{"),
+			LexTok::ReferenceLinkEnd => Cow::Borrowed("}"),
 			LexTok::BlankLine => Cow::Borrowed(""),
 		}
 	}
@@ -160,12 +191,14 @@ impl LexTok {
 			LexTok::EndOfLine => false,
 			LexTok::CodeStart => true,
 			LexTok::CodeEnd => true,
+			LexTok::ReferenceLinkStart { .. } => true,
+			LexTok::ReferenceLinkEnd => true,
 			LexTok::BlankLine => false,
 		}
 	}
 }
 
-struct Parser {
+pub struct Parser {
 	last_line_blank: bool,
 	tokens: Vec<Token>,
 }
@@ -178,10 +211,11 @@ impl Parser {
 		}
 	}
 
-	pub fn parse(&mut self, lex: Lexer) {
-		let Lexer { tokens, .. } = lex;
+	pub fn parse<S: AsRef<str>>(&mut self, str: S) {
+		let mut lex = Lexer::new();
+		lex.lex(str.as_ref());
 
-		let mut iter = tokens.into_iter().peekable();
+		let mut iter = lex.tokens.into_iter().peekable();
 
 		loop {
 			match iter.peek() {
@@ -219,6 +253,7 @@ impl Parser {
 			match iter.next() {
 				None => break,
 				Some(LexTok::CodeStart) => Self::inline_code(&mut ret, &mut iter),
+				Some(LexTok::ReferenceLinkStart) => Self::reference_link(&mut ret, &mut iter),
 				Some(LexTok::Text(txt)) => ret.push(Inline::Text(txt)),
 				_ => (),
 			}
@@ -301,6 +336,24 @@ impl Parser {
 		}
 	}
 
+	fn reference_link(tokens: &mut Vec<Inline>, iter: &mut impl Iterator<Item = LexTok>) {
+		match iter.next() {
+			Some(LexTok::Text(reftext)) => {
+				match iter.next() {
+					Some(LexTok::ReferenceLinkEnd) => (),
+					//FIXME: gen- Error
+					_ => panic!("Expected LexTok::CodeEnd"),
+				}
+
+				tokens.push(Inline::Reflink(reftext));
+			}
+			Some(LexTok::CodeEnd) => {
+				tokens.push(Inline::Code(String::new()));
+			}
+			_ => panic!(),
+		}
+	}
+
 	fn take_until<I, T>(iter: &mut I, end: T, include_end: bool) -> Vec<T>
 	where
 		I: Iterator<Item = T>,
@@ -329,6 +382,7 @@ enum Inline {
 	Break,
 	Text(String),
 	Code(String),
+	Reflink(String),
 }
 
 impl Inline {
@@ -338,6 +392,10 @@ impl Inline {
 
 	pub fn code<S: Into<String>>(text: S) -> Self {
 		Inline::Code(text.into())
+	}
+
+	pub fn reflink<S: Into<String>>(text: S) -> Self {
+		Inline::Reflink(text.into())
 	}
 }
 
@@ -354,12 +412,10 @@ mod test {
 
 	#[test]
 	fn everything() {
-		let str = "# Header\nSome text below the header.\nA break and some `code`\n\nNew paragraph!\n```lang\nCode!\nCode.\n```";
+		let str = "# Header\nSome text below the header.\nA break and some `code` and a {reflink}\n\nNew paragraph!\n```lang\nCode!\nCode.\n```";
 
-		let mut lex = Lexer::new();
-		lex.lex(str.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(str);
 
 		assert_eq!(
 			parser.tokens,
@@ -373,7 +429,9 @@ mod test {
 						Inline::text("Some text below the header."),
 						Inline::Break,
 						Inline::text("A break and some "),
-						Inline::code("code")
+						Inline::code("code"),
+						Inline::text(" and a "),
+						Inline::reflink("reflink")
 					]
 				},
 				Token::Paragraph {
@@ -391,10 +449,8 @@ mod test {
 	fn breaks_paragraphs_correctly() {
 		let str = "Text\nAnother Line\n\nAnother Paragraph";
 
-		let mut lex = Lexer::new();
-		lex.lex(str.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(str);
 
 		assert_eq!(
 			parser.tokens,
@@ -417,10 +473,8 @@ mod test {
 	fn headers_parse_correctly() {
 		let lvl1 = "# Header!\nAnd some text below";
 
-		let mut lex = Lexer::new();
-		lex.lex(lvl1.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(lvl1);
 
 		assert_eq!(
 			parser.tokens,
@@ -440,10 +494,8 @@ mod test {
 	fn code_blocks_parse_correctly() {
 		let txt = "```html\n<html>\n\n<body>Body!</body>\n\n</html>\n```";
 
-		let mut lex = Lexer::new();
-		lex.lex(txt.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(txt);
 
 		assert_eq!(
 			parser.tokens,
@@ -458,10 +510,8 @@ mod test {
 	fn inline_code_parses_correctly() {
 		let txt = "`code`";
 
-		let mut lex = Lexer::new();
-		lex.lex(txt.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(txt);
 
 		assert_eq!(
 			parser.tokens,
@@ -475,10 +525,8 @@ mod test {
 	fn inline_code_parses_correctly_after_text() {
 		let txt = "Normal text and then `code`";
 
-		let mut lex = Lexer::new();
-		lex.lex(txt.into());
 		let mut parser = Parser::new();
-		parser.parse(lex);
+		parser.parse(txt);
 
 		assert_eq!(
 			parser.tokens,
@@ -487,6 +535,21 @@ mod test {
 					Inline::Text(String::from("Normal text and then ")),
 					Inline::Code(String::from("code"))
 				]
+			}]
+		)
+	}
+
+	#[test]
+	fn reflink_parses_correctly() {
+		let txt = "{reflink}";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::reflink("reflink")]
 			}]
 		)
 	}

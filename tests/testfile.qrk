@@ -1,0 +1,4 @@
+Alright this file is meant to evolve here as I write the code and show me how far along I am. It's August 15th, 2022 and I 'd love to get paragraphs and proper line-stuff working along with a lot of block element parsing. They seem interlinked to me.
+
+This should be a separate paragraph and should be broken from the one above by some free space above it.
+And this is a break in the same paragraph! No blank line means no new paragraph, but you do get something like a `<br>`
