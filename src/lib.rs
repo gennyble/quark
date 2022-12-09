@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{
-	borrow::{Borrow, BorrowMut, Cow},
+	borrow::Cow,
+	collections::HashMap,
 	iter::{self, Peekable},
 	str::Chars,
 };
@@ -60,6 +61,20 @@ impl Lexer {
 
 		self.header(&mut chars);
 
+		// Loose parsing of reference links
+		if line.starts_with('[') {
+			match line.find("]:") {
+				None => (),
+				Some(idx) => {
+					let name = line[1..idx].to_owned();
+					let link = line[idx + 2..].to_owned();
+
+					self.tokens.push(LexTok::LinkReference { name, link });
+					return;
+				}
+			}
+		}
+
 		// Now the inline
 
 		self.parse_for_inlines(&mut chars)
@@ -69,6 +84,7 @@ impl Lexer {
 		let mut escape = false;
 		let mut code = false;
 		let mut reflink = false;
+		let mut link = false;
 		let mut current = String::new();
 
 		macro_rules! push_and_clear {
@@ -94,27 +110,39 @@ impl Lexer {
 				continue;
 			}
 
-			if ch == '`' && !code && !reflink {
+			if ch == '`' && !code && !reflink && !link {
 				push_and_clear!();
 				self.tokens.push(LexTok::CodeStart);
 				code = true;
 				continue;
-			} else if ch == '`' && code && !reflink {
+			} else if ch == '`' && code && !reflink && !link {
 				push_and_clear!();
 				self.tokens.push(LexTok::CodeEnd);
 				code = false;
 				continue;
 			}
 
-			if ch == '{' && !reflink && !code {
+			if ch == '{' && !reflink && !code && !link {
 				push_and_clear!();
-				self.tokens.push(LexTok::ReferenceLinkStart);
+				self.tokens.push(LexTok::InterlinkStart);
 				reflink = true;
 				continue;
-			} else if ch == '}' && reflink && !code {
+			} else if ch == '}' && reflink && !code && !link {
 				push_and_clear!();
-				self.tokens.push(LexTok::ReferenceLinkEnd);
+				self.tokens.push(LexTok::InterlinkEnd);
 				reflink = false;
+				continue;
+			}
+
+			if ch == '[' && !link && !code && !reflink {
+				push_and_clear!();
+				self.tokens.push(LexTok::LinkStart);
+				link = true;
+				continue;
+			} else if ch == ']' && link && !code && !reflink {
+				push_and_clear!();
+				self.tokens.push(LexTok::LinkEnd);
+				link = false;
 				continue;
 			}
 
@@ -161,8 +189,11 @@ enum LexTok {
 	EndOfLine,
 	CodeStart,
 	CodeEnd,
-	ReferenceLinkStart,
-	ReferenceLinkEnd,
+	InterlinkStart,
+	InterlinkEnd,
+	LinkReference { name: String, link: String },
+	LinkStart,
+	LinkEnd,
 	BlankLine,
 }
 
@@ -176,8 +207,11 @@ impl LexTok {
 			LexTok::EndOfLine => Cow::Borrowed("\n"),
 			LexTok::CodeStart => Cow::Borrowed("`"),
 			LexTok::CodeEnd => Cow::Borrowed("`"),
-			LexTok::ReferenceLinkStart => Cow::Borrowed("{"),
-			LexTok::ReferenceLinkEnd => Cow::Borrowed("}"),
+			LexTok::InterlinkStart => Cow::Borrowed("{"),
+			LexTok::InterlinkEnd => Cow::Borrowed("}"),
+			LexTok::LinkReference { name, link } => Cow::Owned(format!("[{name}]:{link}")),
+			LexTok::LinkStart => Cow::Borrowed("["),
+			LexTok::LinkEnd => Cow::Borrowed("]"),
 			LexTok::BlankLine => Cow::Borrowed(""),
 		}
 	}
@@ -192,8 +226,11 @@ impl LexTok {
 			LexTok::EndOfLine => false,
 			LexTok::CodeStart => true,
 			LexTok::CodeEnd => true,
-			LexTok::ReferenceLinkStart { .. } => true,
-			LexTok::ReferenceLinkEnd => true,
+			LexTok::InterlinkStart => true,
+			LexTok::InterlinkEnd => true,
+			LexTok::LinkReference { .. } => false,
+			LexTok::LinkStart => true,
+			LexTok::LinkEnd => true,
 			LexTok::BlankLine => false,
 		}
 	}
@@ -208,6 +245,7 @@ impl fmt::Display for LexTok {
 pub struct Parser {
 	last_line_blank: bool,
 	tokens: Vec<Token>,
+	pub references: HashMap<String, String>,
 }
 
 impl Parser {
@@ -215,6 +253,7 @@ impl Parser {
 		Parser {
 			last_line_blank: false,
 			tokens: vec![],
+			references: HashMap::new(),
 		}
 	}
 
@@ -222,12 +261,21 @@ impl Parser {
 		let mut lex = Lexer::new();
 		lex.lex(str.as_ref());
 
+		macro_rules! discard_eol {
+			($iter:expr) => {
+				match $iter.next() {
+					Some(LexTok::EndOfLine) => (),
+					Some(tok) => panic!("tried to discord end of line but got {tok:?}"),
+					_ => panic!("Tried to discard end of line but got None"),
+				}
+			};
+		}
+
 		let mut iter = lex.tokens.into_iter().peekable();
 
 		loop {
 			match iter.peek() {
 				Some(tok) if tok.is_inline() => {
-					println!("Isinline");
 					self.paragraph(&mut iter);
 					continue;
 				}
@@ -239,15 +287,21 @@ impl Parser {
 				Some(LexTok::CodeBlockStart { lang }) => self.code_block(lang, &mut iter),
 				Some(LexTok::BlankLine) => {
 					self.last_line_blank = true;
-					iter.next(); // Consume the next token which is an EOL
+					discard_eol!(iter)
+				}
+				Some(LexTok::LinkReference { name, link }) => {
+					self.references.insert(name.trim().to_owned(), link);
+					discard_eol!(iter)
 				}
 				None => return,
 				//TODO: gen- we should emit and error on these
 				Some(tok) => panic!("Should have been caught earlier {:?}", tok),
-				Some(LexTok::EndOfLine) => (),
-				Some(LexTok::CodeBlockEnd) => panic!("Saw CodeEnd"),
 			}
 		}
+	}
+
+	pub fn tokens<'a>(&'a self) -> std::slice::Iter<'a, Token> {
+		self.tokens.iter()
 	}
 
 	fn build_line(lextokens: Vec<LexTok>) -> Vec<Inline> {
@@ -260,7 +314,8 @@ impl Parser {
 			match iter.next() {
 				None => break,
 				Some(LexTok::CodeStart) => Self::inline_code(&mut ret, &mut iter),
-				Some(LexTok::ReferenceLinkStart) => Self::reference_link(&mut ret, &mut iter),
+				Some(LexTok::InterlinkStart) => Self::interlink(&mut ret, &mut iter),
+				Some(LexTok::LinkStart) => Self::link(&mut ret, &mut iter),
 				Some(LexTok::Text(txt)) => ret.push(Inline::Text(txt)),
 				_ => (),
 			}
@@ -362,24 +417,59 @@ impl Parser {
 		}
 	}
 
-	fn reference_link(tokens: &mut Vec<Inline>, iter: &mut impl Iterator<Item = LexTok>) {
+	fn interlink(tokens: &mut Vec<Inline>, iter: &mut impl Iterator<Item = LexTok>) {
 		match iter.next() {
 			Some(LexTok::Text(reftext)) => {
 				match iter.next() {
-					Some(LexTok::ReferenceLinkEnd) => (),
+					Some(LexTok::InterlinkEnd) => (),
 					//FIXME: gen- Error
-					_ => panic!("Expected LexTok::ReferenceLinkEnd"),
+					_ => panic!("Expected LexTok::InterlinkEnd"),
 				}
 
-				tokens.push(Inline::Reflink(reftext));
+				tokens.push(Inline::Interlink(Self::make_link(reftext)));
 			}
-			Some(LexTok::ReferenceLinkEnd) => tokens.push(Inline::Text(format!(
+			Some(LexTok::InterlinkEnd) => tokens.push(Inline::Text(format!(
 				"{}{}",
-				LexTok::ReferenceLinkStart,
-				LexTok::ReferenceLinkEnd
+				LexTok::InterlinkStart,
+				LexTok::InterlinkEnd
 			))),
-			None => tokens.push(Inline::Text(LexTok::ReferenceLinkStart.to_string())),
+			None => tokens.push(Inline::Text(LexTok::InterlinkStart.to_string())),
 			_ => panic!(),
+		}
+	}
+
+	fn link(tokens: &mut Vec<Inline>, iter: &mut impl Iterator<Item = LexTok>) {
+		match iter.next() {
+			Some(LexTok::Text(link)) => {
+				match iter.next() {
+					Some(LexTok::LinkEnd) => (),
+					//FIXME: gen- Error
+					_ => panic!("Expected LexTok::LinkEnd"),
+				}
+
+				match link.strip_prefix('!') {
+					None => tokens.push(Inline::Link(Self::make_link(link))),
+					Some(stripped) => {
+						tokens.push(Inline::ReferenceLink(Self::make_link(stripped.to_owned())))
+					}
+				}
+			}
+			Some(LexTok::LinkEnd) => tokens.push(Inline::Text(format!(
+				"{}{}",
+				LexTok::LinkStart,
+				LexTok::LinkEnd
+			))),
+			None => tokens.push(Inline::Text(LexTok::LinkStart.to_string())),
+			_ => panic!(),
+		}
+	}
+
+	fn make_link<S: AsRef<str>>(s: S) -> Link {
+		let s = s.as_ref();
+
+		match s.split_once('|') {
+			None => Link::nameless(s),
+			Some((name, link)) => Link::new(name, link),
 		}
 	}
 
@@ -407,11 +497,44 @@ impl Parser {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Inline {
+pub struct Link {
+	pub name: Option<String>,
+	pub location: String,
+}
+
+impl Link {
+	pub fn nameless<S: Into<String>>(location: S) -> Link {
+		Link {
+			name: None,
+			location: location.into(),
+		}
+	}
+
+	pub fn new<S: Into<String>, N: Into<String>>(name: N, location: S) -> Link {
+		Link {
+			name: Some(name.into()),
+			location: location.into(),
+		}
+	}
+}
+
+impl fmt::Display for Link {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match &self.name {
+			None => write!(f, "{}", self.location),
+			Some(name) => write!(f, "{name}|{}", self.location),
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Inline {
 	Break,
 	Text(String),
 	Code(String),
-	Reflink(String),
+	Interlink(Link),
+	Link(Link),
+	ReferenceLink(Link),
 }
 
 impl Inline {
@@ -423,13 +546,21 @@ impl Inline {
 		Inline::Code(text.into())
 	}
 
-	pub fn reflink<S: Into<String>>(text: S) -> Self {
-		Inline::Reflink(text.into())
+	pub fn interlink(link: Link) -> Self {
+		Inline::Interlink(link)
+	}
+
+	pub fn link(link: Link) -> Self {
+		Inline::Link(link)
+	}
+
+	pub fn reference_link(link: Link) -> Self {
+		Inline::ReferenceLink(link)
 	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Token {
+pub enum Token {
 	Header { level: u8, inner: Vec<Inline> },
 	Paragraph { inner: Vec<Inline> },
 	CodeBlock { lang: String, code: String },
@@ -437,14 +568,35 @@ enum Token {
 
 #[cfg(test)]
 mod test {
-	use crate::{Inline, Lexer, Parser, Token};
+	use std::collections::HashMap;
+
+	use crate::{Inline, Link, Parser, Token};
 
 	#[test]
 	fn everything() {
-		let str = "# Header\nSome text below the header.\nA break and some `code` and a {reflink}\n\nNew paragraph!\n```lang\nCode!\nCode.\n```";
+		let str = r###"
+# Header
+Some text below the header.
+A break and some `code` and a {interlink}
+
+Okay, linkfest! [link] and [!link]
+Now some named stuff: {Named Interlink|interlink}[Named Link|link][!Named Reference|reflink]
+
+[link]: ref!
+
+New paragraph!
+```lang
+Code!
+Code.
+```"###;
 
 		let mut parser = Parser::new();
 		parser.parse(str);
+
+		let mut rfs = HashMap::new();
+		rfs.insert("link".to_string(), " ref!".to_string());
+
+		assert_eq!(parser.references, rfs);
 
 		assert_eq!(
 			parser.tokens,
@@ -460,7 +612,20 @@ mod test {
 						Inline::text("A break and some "),
 						Inline::code("code"),
 						Inline::text(" and a "),
-						Inline::reflink("reflink")
+						Inline::interlink(Link::nameless("interlink"))
+					]
+				},
+				Token::Paragraph {
+					inner: vec![
+						Inline::text("Okay, linkfest! "),
+						Inline::link(Link::nameless("link")),
+						Inline::text(" and "),
+						Inline::reference_link(Link::nameless("link")),
+						Inline::Break,
+						Inline::text("Now some named stuff: "),
+						Inline::interlink(Link::new("Named Interlink", "interlink")),
+						Inline::link(Link::new("Named Link", "link")),
+						Inline::reference_link(Link::new("Named Reference", "reflink"))
 					]
 				},
 				Token::Paragraph {
@@ -584,8 +749,8 @@ mod test {
 	}
 
 	#[test]
-	fn reflink_parses_correctly() {
-		let txt = "{reflink}";
+	fn interlink_parses_correctly() {
+		let txt = "{interlink}";
 
 		let mut parser = Parser::new();
 		parser.parse(txt);
@@ -593,7 +758,7 @@ mod test {
 		assert_eq!(
 			parser.tokens,
 			vec![Token::Paragraph {
-				inner: vec![Inline::reflink("reflink")]
+				inner: vec![Inline::interlink(Link::nameless("interlink"))]
 			}]
 		)
 	}
@@ -609,6 +774,61 @@ mod test {
 			parser.tokens,
 			vec![Token::Paragraph {
 				inner: vec![Inline::text("{}")]
+			}]
+		)
+	}
+
+	#[test]
+	fn parses_link_reference() {
+		let txt = "[ref]: link!";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(parser.references.get("ref"), Some(&" link!".to_string()))
+	}
+
+	#[test]
+	fn link_parses_correctly() {
+		let txt = "[link]";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::link(Link::nameless("link"))]
+			}]
+		)
+	}
+
+	#[test]
+	fn reference_link_parses_correctly() {
+		let txt = "[!link]";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::reference_link(Link::nameless("link"))]
+			}]
+		)
+	}
+
+	#[test]
+	fn named_links_parse_correctly() {
+		let txt = "[Named | link]";
+
+		let mut parser = Parser::new();
+		parser.parse(txt);
+
+		assert_eq!(
+			parser.tokens,
+			vec![Token::Paragraph {
+				inner: vec![Inline::link(Link::new("Named ", " link"))]
 			}]
 		)
 	}
